@@ -96,7 +96,6 @@ func main() {
 		for _, match := range matches {
 			fmt.Printf("Inserting Match ID: %s...\n", match.MatchID)
 
-			// Start a Database Transaction
 			tx, err := db.Begin()
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
@@ -105,7 +104,7 @@ func main() {
 
 			// 1. Upsert Teams
 			_, err = tx.Exec(`INSERT INTO teams (id, name) VALUES ($1, $2), ($3, $4) 
-				ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+                ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
 				match.TeamAID, match.TeamA, match.TeamBID, match.TeamB)
 			if err != nil {
 				tx.Rollback()
@@ -114,68 +113,97 @@ func main() {
 
 			// 2. Insert Match
 			_, err = tx.Exec(`INSERT INTO matches (id, tournament, match_date, team_a_id, team_b_id) 
-				VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`,
+                VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`,
 				match.MatchID, match.Tournament, match.Date, match.TeamAID, match.TeamBID)
 			if err != nil {
 				tx.Rollback()
 				continue
 			}
 
-			// 3. Insert Draft Phase
+			// 3. Insert Draft Phase (Fuzzy Match for Team IDs)
 			for stepIndex, draft := range match.DraftPhase {
 				var mapID int
 				err = tx.QueryRow(`INSERT INTO maps (name) VALUES ($1) 
-					ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`, draft.Map).Scan(&mapID)
+                    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`, draft.Map).Scan(&mapID)
 
 				var draftTeamID *string
-				if strings.Contains(strings.ToLower(match.TeamA), strings.ToLower(draft.Team)) {
-					draftTeamID = &match.TeamAID
-				} else if strings.Contains(strings.ToLower(match.TeamB), strings.ToLower(draft.Team)) {
-					draftTeamID = &match.TeamBID
+				dTeam := strings.ToLower(strings.TrimSpace(draft.Team))
+				tA := strings.ToLower(match.TeamA)
+				tB := strings.ToLower(match.TeamB)
+
+				// Skip "None" or empty teams (common in 'remains' action)
+				if dTeam != "" && dTeam != "none" {
+					if strings.Contains(tA, dTeam) || strings.Contains(dTeam, tA) {
+						draftTeamID = &match.TeamAID
+					} else if strings.Contains(tB, dTeam) || strings.Contains(dTeam, tB) {
+						draftTeamID = &match.TeamBID
+					}
 				}
 
 				tx.Exec(`INSERT INTO match_drafts (match_id, step_number, team_id, action, map_id) 
-					VALUES ($1, $2, $3, $4, $5)`, match.MatchID, stepIndex+1, draftTeamID, draft.Action, mapID)
+                    VALUES ($1, $2, $3, $4, $5)`, match.MatchID, stepIndex+1, draftTeamID, draft.Action, mapID)
 			}
 
-			// 4. Insert Maps & Player Stats
+			// 4. Insert Maps & Player Stats (Calculating Winners)
+			mapsWonA := 0
+			mapsWonB := 0
+
 			for _, result := range match.MapResults {
 				var mapID int
 				err = tx.QueryRow(`INSERT INTO maps (name) VALUES ($1) 
-					ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`, result.MapName).Scan(&mapID)
+                    ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`, result.MapName).Scan(&mapID)
+
+				scoreA := cleanInt(result.TeamAScore)
+				scoreB := cleanInt(result.TeamBScore)
+
+				var mapWinnerID *string
+				if scoreA > scoreB {
+					mapWinnerID = &match.TeamAID
+					mapsWonA++
+				} else if scoreB > scoreA {
+					mapWinnerID = &match.TeamBID
+					mapsWonB++
+				}
 
 				var mapResultID int
-				err = tx.QueryRow(`INSERT INTO map_results (match_id, map_id, team_a_score, team_b_score) 
-					VALUES ($1, $2, $3, $4) RETURNING id`,
-					match.MatchID, mapID, cleanInt(result.TeamAScore), cleanInt(result.TeamBScore)).Scan(&mapResultID)
-				
+				err = tx.QueryRow(`INSERT INTO map_results (match_id, map_id, team_a_score, team_b_score, winner_id) 
+                    VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+					match.MatchID, mapID, scoreA, scoreB, mapWinnerID).Scan(&mapResultID)
+
 				if err != nil {
-					tx.Rollback()
-					break
+					continue
 				}
 
 				for _, stat := range result.PlayerStats {
-					// Upsert Player
 					tx.Exec(`INSERT INTO players (id, name, team_id) VALUES ($1, $2, $3) 
-						ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
+                        ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name`,
 						stat.PlayerID, stat.PlayerName, stat.TeamID)
 
-					// Upsert Agent
 					var agentID int
-					err = tx.QueryRow(`INSERT INTO agents (name, role) VALUES ($1, 'Unknown') 
-						ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`, stat.Agent).Scan(&agentID)
+					tx.QueryRow(`INSERT INTO agents (name, role) VALUES ($1, 'Unknown') 
+                        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id`, stat.Agent).Scan(&agentID)
 
-					// Insert Final Player Stats
 					tx.Exec(`INSERT INTO player_stats 
-						(map_result_id, player_id, team_id, agent_id, acs, kills, deaths, assists, first_kills, first_deaths) 
-						VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						mapResultID, stat.PlayerID, stat.TeamID, agentID, 
-						cleanInt(stat.ACS), cleanInt(stat.Kills), cleanInt(stat.Deaths), cleanInt(stat.Assists), 
+                        (map_result_id, player_id, team_id, agent_id, acs, kills, deaths, assists, first_kills, first_deaths) 
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						mapResultID, stat.PlayerID, stat.TeamID, agentID,
+						cleanInt(stat.ACS), cleanInt(stat.Kills), cleanInt(stat.Deaths), cleanInt(stat.Assists),
 						cleanInt(stat.FirstKills), cleanInt(stat.FirstDeaths))
 				}
 			}
-			
-			// Commit the transaction
+
+			// 5. Final Match Winner Update
+			var matchWinnerID *string
+			if mapsWonA > mapsWonB {
+				matchWinnerID = &match.TeamAID
+			} else if mapsWonB > mapsWonA {
+				matchWinnerID = &match.TeamBID
+			}
+
+			if matchWinnerID != nil {
+				tx.Exec(`UPDATE matches SET winner_id = $1 WHERE id = $2`, matchWinnerID, match.MatchID)
+			}
+
 			if err := tx.Commit(); err != nil {
 				log.Println("Failed to commit transaction:", err)
 			} else {
@@ -186,12 +214,11 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"status": "success"})
 	})
 
-	// --- 4. Render Port Configuration ---
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // Fallback for local testing
+		port = "8080"
 	}
 
 	fmt.Printf("Go Backend listening on port :%s\n", port)
 	router.Run(":" + port)
-}
+} 
